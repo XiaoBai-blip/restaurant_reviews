@@ -1,12 +1,93 @@
 import logging
+import time
 
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://lamadeleine.com/locations"
-API_URL = "https://lamadeleine.com/wp-json/wp/v2/restaurant-locations?per_page=150"
+API_URL = "https://lamadeleine.com/wp-json/wp/v2/restaurant-locations"
+PER_PAGE = 100
+REQUEST_TIMEOUT_MS = 30000
+MAX_RETRIES = 3
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
+def fetch_page(page, page_num, per_page=PER_PAGE, timeout_ms=REQUEST_TIMEOUT_MS):
+    return page.evaluate(
+        """
+        async ({ apiUrl, pageNum, perPage, timeoutMs }) => {
+            const url = new URL(apiUrl);
+            url.searchParams.set("per_page", String(perPage));
+            url.searchParams.set("page", String(pageNum));
+
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+            try {
+                const res = await fetch(url.toString(), {
+                    method: "GET",
+                    headers: {
+                        "Accept": "application/json, text/plain, */*",
+                        "Referer": "https://lamadeleine.com/locations"
+                    },
+                    signal: controller.signal
+                });
+
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+                }
+
+                const data = await res.json();
+                const totalPages = parseInt(res.headers.get("X-WP-TotalPages") || "1", 10);
+                const totalRecords = parseInt(
+                    res.headers.get("X-WP-Total") || String(Array.isArray(data) ? data.length : 0),
+                    10
+                );
+
+                return {
+                    data,
+                    totalPages,
+                    totalRecords
+                };
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+        """,
+        {
+            "apiUrl": API_URL,
+            "pageNum": page_num,
+            "perPage": per_page,
+            "timeoutMs": timeout_ms,
+        },
+    )
+
+
+def fetch_page_with_retry(page, page_num, per_page=PER_PAGE, max_retries=MAX_RETRIES):
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1:
+                logging.info("Retrying page %s (attempt %s/%s)...", page_num, attempt, max_retries)
+
+            return fetch_page(page, page_num, per_page=per_page)
+
+        except Exception as e:
+            last_error = e
+            logging.warning(
+                "Failed to fetch page %s on attempt %s/%s: %s",
+                page_num,
+                attempt,
+                max_retries,
+                e,
+            )
+
+            if attempt < max_retries:
+                time.sleep(0.5 * attempt)
+
+    raise RuntimeError(f"Failed to fetch page {page_num} after {max_retries} attempts") from last_error
 
 
 def fetch_data():
@@ -14,29 +95,44 @@ def fetch_data():
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page()
+            page.set_default_timeout(REQUEST_TIMEOUT_MS)
+            page.set_default_navigation_timeout(REQUEST_TIMEOUT_MS)
+
             page.goto(BASE_URL, wait_until="networkidle")
 
-            data = page.evaluate(
-                """
-                async (apiUrl) => {
-                    const res = await fetch(apiUrl, {
-                        method: "GET",
-                        headers: {
-                            "Accept": "application/json, text/plain, */*",
-                            "Referer": "https://lamadeleine.com/locations"
-                        }
-                    });
+            first = fetch_page_with_retry(page, 1)
+            first_page_data = first["data"]
+            total_pages = first["totalPages"]
+            total_records = first["totalRecords"]
 
-                    if (!res.ok) {
-                        throw new Error(`HTTP ${res.status} ${res.statusText}`);
-                    }
+            if not isinstance(first_page_data, list):
+                raise RuntimeError("Unexpected API response: first page is not a list.")
 
-                    return await res.json();
-                }
-                """,
-                API_URL,
+            logging.info(
+                "API reports %s total record(s) across %s page(s).",
+                total_records,
+                total_pages,
             )
-            return data
+
+            all_records = list(first_page_data)
+
+            if total_pages > 1:
+                logging.info("Pagination detected. Fetching pages 2 to %s...", total_pages)
+                for page_num in range(2, total_pages + 1):
+                    result = fetch_page_with_retry(page, page_num)
+                    page_data = result["data"]
+
+                    if isinstance(page_data, list):
+                        all_records.extend(page_data)
+                    else:
+                        logging.warning(
+                            "Skipping unexpected non-list response on page %s.",
+                            page_num,
+                        )
+
+            logging.info("Fetched %s total record(s).", len(all_records))
+            return all_records
+
         finally:
             browser.close()
 
@@ -63,10 +159,6 @@ def get_by_path(obj, path, default=""):
 
 
 def find_anywhere(obj, target_keys):
-    """
-    Recursively search for a key anywhere in a nested dict/list structure.
-    Returns the first non-empty match and the key name that matched.
-    """
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k in target_keys and v not in [None, "", [], {}]:
@@ -83,10 +175,6 @@ def find_anywhere(obj, target_keys):
 
 
 def pick_value(rec, field_name, paths=None, fallback_keys=None):
-    """
-    Try exact nested paths first, then recursively search by fallback keys.
-    Returns the extracted value.
-    """
     paths = paths or []
     fallback_keys = fallback_keys or []
 
@@ -110,7 +198,6 @@ def pick_value(rec, field_name, paths=None, fallback_keys=None):
 
 
 def build_full_address(street1, street2, city, state, postal):
-    # Avoid repeating suite/unit if it is already embedded in street1.
     if street1 and street2 and street2 in street1:
         street2 = ""
 
@@ -128,11 +215,6 @@ def build_full_address(street1, street2, city, state, postal):
 
 
 def normalize_location(rec):
-    # Current schema (WordPress + ACF):
-    # acf.locationHero.storeName
-    # acf.locationHero.addressLine1 / addressLine2
-    # acf.locationHero.city / state / zip
-
     location_name = pick_value(
         rec,
         field_name="locationName",
@@ -259,7 +341,6 @@ def main():
             df[col] = ""
 
     df = df[required_cols].drop_duplicates().fillna("")
-
     df.to_csv("lamadeleine_locations.csv", index=False, encoding="utf-8-sig")
 
     print("Saved lamadeleine_locations.csv")
